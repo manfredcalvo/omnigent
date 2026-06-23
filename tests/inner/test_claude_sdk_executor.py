@@ -1326,13 +1326,28 @@ class TestCompaction(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
         async def _t():
-            fake, _ResultMessage, _ = self._fake_sdk([], blocking=True)
+            fake, _ResultMessage, SDKSystemMessage = self._fake_sdk([])
+            # The real no-op failure mode: /compact emits PREAMBLE (init/status
+            # with no compact_result) and then stalls with no ResultMessage. A
+            # "no messages seen" guard would miss this; the total-elapsed bound
+            # must still end the turn.
+            preamble = self._status(SDKSystemMessage, status="requesting")
+
+            async def _preamble_then_block(_self):
+                yield preamble
+                await asyncio.sleep(30)
+
+            fake.ClaudeSDKClient.receive_response = _preamble_then_block
             executor = ClaudeSDKExecutor()
             with (
                 patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake),
                 patch(
                     "omnigent.inner.claude_sdk_executor._COMPACT_TURN_TIMEOUT_SECONDS",
                     0.3,
+                ),
+                patch(
+                    "omnigent.inner.claude_sdk_executor._COMPACT_POLL_SECONDS",
+                    0.05,
                 ),
             ):
                 events = await asyncio.wait_for(
@@ -1342,7 +1357,8 @@ class TestCompaction(unittest.TestCase):
                     timeout=10,
                 )
             # No compaction happened (no-op): no CompactionStatus, but the turn
-            # ends promptly with a TurnComplete rather than hanging.
+            # ends promptly with a TurnComplete rather than hanging — even though
+            # a preamble message arrived first.
             self.assertEqual([e for e in events if isinstance(e, CompactionStatus)], [])
             self.assertTrue(any(isinstance(e, TurnComplete) for e in events))
 

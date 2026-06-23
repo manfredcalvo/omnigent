@@ -7741,10 +7741,21 @@ def create_runner_app(
         if process_manager is None:
             return Response(status_code=204)
         if conv_id in _active_turns:
-            # A turn is in flight; the SDK client is busy. The REPL already
-            # guards this, but double-check so we never drive a /compact turn
-            # concurrently with a real one. Ack handled; nothing to do.
+            # A turn is in flight; the SDK client is busy. Don't drive a
+            # /compact turn concurrently with a real one. But don't go silent:
+            # acknowledge with the spinner and immediately resolve it as failed
+            # (nothing was compacted — a turn is running). Mirrors the 204
+            # "busy" path below, which covers the case where the runner's
+            # _active_turns has desynced from the harness's in-flight state.
             _logger.info("claude-sdk /compact skipped for %s: turn in flight", conv_id)
+            _publish_event(
+                conv_id,
+                {"type": "response.compaction.in_progress", "session_id": conv_id},
+            )
+            _publish_event(
+                conv_id,
+                {"type": "response.compaction.failed", "session_id": conv_id},
+            )
             return Response(status_code=200)
 
         async def _run_compact() -> None:

@@ -332,7 +332,12 @@ _STREAM_IDLE_WARN_SECONDS = 600.0
 # near-empty session is a no-op that emits NOTHING — no ResultMessage — so
 # without this bound the turn would wait out the harness's 240s idle watchdog.
 # Bounded here so the hidden /compact turn finishes promptly in that case.
+# NOTE: a no-op /compact still emits preamble (init/status) messages before
+# stalling, so the bound is on TOTAL elapsed-without-compaction, not "no
+# messages seen". ``_COMPACT_POLL_SECONDS`` is how often we re-check the
+# deadline while a /compact turn is pending.
 _COMPACT_TURN_TIMEOUT_SECONDS = 45.0
+_COMPACT_POLL_SECONDS = 5.0
 
 
 def _is_bare_compact_prompt(prompt: object) -> bool:
@@ -2136,7 +2141,6 @@ class ClaudeSDKExecutor(Executor):
         # to avoid waiting out the harness idle watchdog.
         _is_compact_turn = isinstance(prompt, str) and prompt.strip() == "/compact"
         _turn_started_mono = time.monotonic()
-        _received_any = False
         # The concrete model the SDK reports on its assistant messages, e.g.
         # ``"claude-opus-4-8"``. Captured from the stream because the resolved
         # config ``model`` is ``None`` when the spec pins none and the gateway
@@ -2227,46 +2231,68 @@ class ClaudeSDKExecutor(Executor):
             message_stream = client.receive_response()
             try:
                 while True:
+                    # Bound a /compact turn that never actually compacts —
+                    # whether it stalls silently (caught by the inner wait
+                    # timeout below) OR streams a continuous response (e.g. the
+                    # model treating "/compact" as plain text). Checked here,
+                    # every iteration, so a steady message flow can't starve the
+                    # deadline. Once a real compaction is observed, stop bounding.
+                    if (
+                        _is_compact_turn
+                        and not compaction_seen
+                        and time.monotonic() - _turn_started_mono >= _COMPACT_TURN_TIMEOUT_SECONDS
+                    ):
+                        logger.info(
+                            "Claude SDK /compact did not compact within %ss "
+                            "(session %s); treating as a no-op and ending the turn.",
+                            int(_COMPACT_TURN_TIMEOUT_SECONDS),
+                            session_key,
+                        )
+                        break
                     next_task = asyncio.ensure_future(anext(message_stream))
                     idle_seconds = 0.0
                     _compact_noop = False
                     try:
                         while True:
-                            # A ``/compact`` that has not yet emitted ANY message
-                            # is bounded tightly: on a near-empty context it is a
-                            # no-op that never yields a ResultMessage, so we must
-                            # not wait out the long idle window. Once any message
-                            # has arrived (a real compaction is underway), revert
-                            # to the normal idle window so a slow summarization
-                            # isn't cut off mid-stream.
-                            _awaiting_compact_start = _is_compact_turn and not _received_any
+                            # While a ``/compact`` turn has NOT yet produced a
+                            # real compaction, bound it on TOTAL elapsed time:
+                            # poll frequently and end it once it exceeds the
+                            # deadline without compacting. A no-op /compact (tiny
+                            # context) emits preamble (init/status) then stalls
+                            # with no ResultMessage, so a "no messages seen"
+                            # check is insufficient — it would hang the harness's
+                            # single turn slot. Once compaction is observed,
+                            # revert to the normal long idle window so a slow
+                            # summarization isn't cut off mid-stream.
+                            _compact_pending = _is_compact_turn and not compaction_seen
                             _wait_timeout = (
-                                _COMPACT_TURN_TIMEOUT_SECONDS
-                                if _awaiting_compact_start
+                                _COMPACT_POLL_SECONDS
+                                if _compact_pending
                                 else _STREAM_IDLE_WARN_SECONDS
                             )
                             done, _ = await asyncio.wait({next_task}, timeout=_wait_timeout)
                             if next_task in done:
                                 break
-                            if _awaiting_compact_start and (
+                            if _compact_pending and (
                                 time.monotonic() - _turn_started_mono
                                 >= _COMPACT_TURN_TIMEOUT_SECONDS
                             ):
                                 logger.info(
-                                    "Claude SDK /compact emitted nothing within %ss "
+                                    "Claude SDK /compact did not compact within %ss "
                                     "(session %s); treating as a no-op and ending the turn.",
                                     int(_COMPACT_TURN_TIMEOUT_SECONDS),
                                     session_key,
                                 )
                                 _compact_noop = True
                                 break
-                            idle_seconds += _wait_timeout
-                            logger.warning(
-                                "Claude SDK response stream has been idle for "
-                                "%ds (session %s); still waiting.",
-                                int(idle_seconds),
-                                session_key,
-                            )
+                            if not _compact_pending:
+                                idle_seconds += _wait_timeout
+                                logger.warning(
+                                    "Claude SDK response stream has been idle for "
+                                    "%ds (session %s); still waiting.",
+                                    int(idle_seconds),
+                                    session_key,
+                                )
                     except BaseException:
                         next_task.cancel()
                         with suppress(BaseException):
@@ -2283,7 +2309,6 @@ class ClaudeSDKExecutor(Executor):
                         message = next_task.result()
                     except StopAsyncIteration:
                         break
-                    _received_any = True
                     if isinstance(message, _StreamEvent):
                         got_stream_events = True
                         stream_evt = cast(_StreamEventObj, message)
