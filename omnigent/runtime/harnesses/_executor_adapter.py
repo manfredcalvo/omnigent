@@ -46,6 +46,7 @@ from typing import Any
 from fastapi import Response
 
 from omnigent.inner.executor import (
+    CompactionStatus,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -62,6 +63,9 @@ from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
+    CompactionCompletedEvent,
+    CompactionFailedEvent,
+    CompactionInProgressEvent,
     CreateResponseRequest,
     ElicitationRequestParams,
     InjectionConsumedEvent,
@@ -800,6 +804,21 @@ class ExecutorAdapter(HarnessApp):
                     delta=event.text,
                 )
             )
+        elif isinstance(event, CompactionStatus):
+            # The harness compacted its own context (claude-sdk /compact or
+            # auto). Surface the standard compaction indicators; proxy_stream
+            # relays these to the session stream with no special handling.
+            if event.status == "completed":
+                ctx.emit(
+                    CompactionCompletedEvent(
+                        type="response.compaction.completed",
+                        total_tokens=event.total_tokens,
+                    )
+                )
+            elif event.status == "failed":
+                ctx.emit(CompactionFailedEvent(type="response.compaction.failed"))
+            else:
+                ctx.emit(CompactionInProgressEvent(type="response.compaction.in_progress"))
         elif isinstance(event, ReasoningChunk):
             # Translate inner reasoning to the Omnigent wire shape so the
             # workflow sees the same SSE events whether the executor

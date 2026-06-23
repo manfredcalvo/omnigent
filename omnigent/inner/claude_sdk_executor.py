@@ -54,6 +54,7 @@ from ._subprocess_lifecycle import close_anyio_subprocess_transport
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
+    CompactionStatus,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -326,6 +327,31 @@ _QUERY_START_TIMEOUT_SECONDS = 30.0
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
 _STREAM_IDLE_WARN_SECONDS = 600.0
+# Upper bound on a ``/compact`` turn. A real compaction completes in seconds
+# (status + compact_result + a terminal ResultMessage), but ``/compact`` on a
+# near-empty session is a no-op that emits NOTHING — no ResultMessage — so
+# without this bound the turn would wait out the harness's 240s idle watchdog.
+# Bounded here so the hidden /compact turn finishes promptly in that case.
+_COMPACT_TURN_TIMEOUT_SECONDS = 45.0
+
+
+def _is_bare_compact_prompt(prompt: object) -> bool:
+    """Whether *prompt* is just the ``/compact`` slash command.
+
+    True for the string ``"/compact"`` or a single text content block whose
+    text is ``"/compact"`` (the shape the runner's hidden /compact turn takes
+    after content-block conversion). Used to route it to the SDK as the bare
+    slash-command string so the CLI actually compacts rather than treating it
+    as literal user text.
+    """
+    if isinstance(prompt, str):
+        return prompt.strip() == "/compact"
+    if isinstance(prompt, list) and len(prompt) == 1:
+        block = prompt[0]
+        if isinstance(block, dict) and block.get("type") in ("text", "input_text"):
+            return str(block.get("text", "")).strip() == "/compact"
+    return False
+
 
 # ── Multimodal content block conversion ──────────────────────
 
@@ -1860,6 +1886,14 @@ class ClaudeSDKExecutor(Executor):
             messages,
             resume_session=session_key in self._clients,
         )
+        # A bare ``/compact`` must reach the SDK as the slash-command STRING.
+        # The runner's hidden /compact turn arrives as a single input_text
+        # content block, which _build_prompt turns into a structured content
+        # list — and the CLI treats structured content as literal text, never
+        # invoking the slash command. Coerce that single-"/compact" case back
+        # to the bare string so ``query("/compact")`` actually compacts.
+        if _is_bare_compact_prompt(prompt):
+            prompt = "/compact"
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
             # completion with no assistant text instead of an empty string.
@@ -2089,6 +2123,20 @@ class ClaudeSDKExecutor(Executor):
         # CLI can render text chunks and tool-call progress in real time.
         response_text = ""
         turn_usage: dict[str, Any] | None = None  # type: ignore[explicit-any]
+        # Compaction tracking. The Claude CLI compacts its own context in place
+        # (manual ``/compact`` or auto threshold) and reports it via a
+        # ``SystemMessage(subtype="status")`` carrying a ``compact_result`` /
+        # ``compact_error`` field — there is NO PreCompact hook on this path.
+        # We surface CompactionStatus events so the runtime can show the
+        # standard indicators (Omnigent only observes; it does not summarize).
+        compaction_seen = False
+        compaction_failed = False
+        # A bare ``/compact`` turn is special: on a near-empty context it is a
+        # no-op that emits no ResultMessage, so bound it (see the receive loop)
+        # to avoid waiting out the harness idle watchdog.
+        _is_compact_turn = isinstance(prompt, str) and prompt.strip() == "/compact"
+        _turn_started_mono = time.monotonic()
+        _received_any = False
         # The concrete model the SDK reports on its assistant messages, e.g.
         # ``"claude-opus-4-8"``. Captured from the stream because the resolved
         # config ``model`` is ``None`` when the spec pins none and the gateway
@@ -2181,14 +2229,38 @@ class ClaudeSDKExecutor(Executor):
                 while True:
                     next_task = asyncio.ensure_future(anext(message_stream))
                     idle_seconds = 0.0
+                    _compact_noop = False
                     try:
                         while True:
-                            done, _ = await asyncio.wait(
-                                {next_task}, timeout=_STREAM_IDLE_WARN_SECONDS
+                            # A ``/compact`` that has not yet emitted ANY message
+                            # is bounded tightly: on a near-empty context it is a
+                            # no-op that never yields a ResultMessage, so we must
+                            # not wait out the long idle window. Once any message
+                            # has arrived (a real compaction is underway), revert
+                            # to the normal idle window so a slow summarization
+                            # isn't cut off mid-stream.
+                            _awaiting_compact_start = _is_compact_turn and not _received_any
+                            _wait_timeout = (
+                                _COMPACT_TURN_TIMEOUT_SECONDS
+                                if _awaiting_compact_start
+                                else _STREAM_IDLE_WARN_SECONDS
                             )
+                            done, _ = await asyncio.wait({next_task}, timeout=_wait_timeout)
                             if next_task in done:
                                 break
-                            idle_seconds += _STREAM_IDLE_WARN_SECONDS
+                            if _awaiting_compact_start and (
+                                time.monotonic() - _turn_started_mono
+                                >= _COMPACT_TURN_TIMEOUT_SECONDS
+                            ):
+                                logger.info(
+                                    "Claude SDK /compact emitted nothing within %ss "
+                                    "(session %s); treating as a no-op and ending the turn.",
+                                    int(_COMPACT_TURN_TIMEOUT_SECONDS),
+                                    session_key,
+                                )
+                                _compact_noop = True
+                                break
+                            idle_seconds += _wait_timeout
                             logger.warning(
                                 "Claude SDK response stream has been idle for "
                                 "%ds (session %s); still waiting.",
@@ -2200,10 +2272,18 @@ class ClaudeSDKExecutor(Executor):
                         with suppress(BaseException):
                             await next_task
                         raise
+                    if _compact_noop:
+                        # No-op /compact: cancel the pending receive and end the
+                        # turn (falls through to TurnComplete below).
+                        next_task.cancel()
+                        with suppress(BaseException):
+                            await next_task
+                        break
                     try:
                         message = next_task.result()
                     except StopAsyncIteration:
                         break
+                    _received_any = True
                     if isinstance(message, _StreamEvent):
                         got_stream_events = True
                         stream_evt = cast(_StreamEventObj, message)
@@ -2435,7 +2515,25 @@ class ClaudeSDKExecutor(Executor):
                         subtype = system_msg.subtype
                         data = system_msg.data
 
-                        if subtype == "api_retry":
+                        if (
+                            subtype == "status"
+                            and isinstance(data, dict)
+                            and "compact_result" in data
+                        ):
+                            # The CLI compacted its own context in place (manual
+                            # /compact or auto threshold). Surface the standard
+                            # indicators — Omnigent only observes here. "completed"
+                            # is emitted once the turn ends (below); a populated
+                            # ``compact_error`` flips the final event to "failed".
+                            if not compaction_seen:
+                                compaction_seen = True
+                                yield CompactionStatus(
+                                    status="in_progress",
+                                    trigger="manual" if _is_compact_turn else "auto",
+                                )
+                            if data.get("compact_error"):
+                                compaction_failed = True
+                        elif subtype == "api_retry":
                             error_status = data.get("error_status")
                             retry_error = data.get("error", "unknown_error")
                             attempt = data.get("attempt")
@@ -2520,6 +2618,19 @@ class ClaudeSDKExecutor(Executor):
                 _deny_reason = _resp_verdict.reason or "no reason given"
                 yield ExecutorError(message=(f"LLM response denied by policy: {_deny_reason}"))
                 return
+
+        # If the turn compacted (manual /compact or auto), close out the
+        # indicator now that the turn is ending. ``context_tokens`` is the
+        # post-compaction window fill when the SDK reported usage.
+        if compaction_seen:
+            _post_tokens = (
+                turn_usage.get("context_tokens") if isinstance(turn_usage, dict) else None
+            )
+            yield CompactionStatus(
+                status="failed" if compaction_failed else "completed",
+                trigger="manual" if _is_compact_turn else "auto",
+                total_tokens=_post_tokens,
+            )
 
         _notify_usage_from_dict(model=model, usage=turn_usage)
         yield TurnComplete(response=response_text, usage=turn_usage)

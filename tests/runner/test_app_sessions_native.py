@@ -10035,6 +10035,118 @@ async def test_events_compact_on_non_native_session_is_204_noop(
 
 
 @pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_runs_hidden_turn() -> None:
+    """
+    claude-sdk ``/compact`` drives a HIDDEN ``/compact`` turn in the harness.
+
+    The SDK owns its own context, so explicit compaction must run inside the
+    harness (the SDK client can only be driven from its owning per-turn task).
+    The runner sends a real ``/compact`` message turn and DRAINS its SSE,
+    RELAYING only the ``response.compaction.*`` indicators the harness emits
+    (the executor surfaces them as it observes the SDK compact in place) and
+    hiding everything else — so the /compact turn never lands in the
+    transcript/UI. Fire-and-ack: 200 returns immediately, turn runs async.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    stream_finished = asyncio.Event()
+    # The harness's /compact turn emits compaction indicators (which the runner
+    # relays) plus normal turn frames (a delta, created/completed) that must be
+    # HIDDEN — proving the runner relays only the compaction events.
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_c1"}}),
+        _sse({"type": "response.output_text.delta", "delta": "should-not-leak"}),
+        _sse({"type": "response.compaction.in_progress"}),
+        _sse({"type": "response.compaction.completed", "total_tokens": 7000}),
+        _sse({"type": "response.completed", "response": {"id": "resp_c1"}}),
+    ]
+    hc = _ScriptedHarnessClient(sse_frames, stream_finished=stream_finished)
+    pm = _FakeProcessManager(hc)
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="sdk-compact",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_sdk_compact", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        collected: list[dict[str, Any]] = []
+
+        async def _subscribe() -> None:
+            async with client.stream("GET", "/v1/sessions/conv_sdk_compact/stream") as stream:
+                async for line in stream.aiter_lines():
+                    if line.startswith("data: "):
+                        payload = line[6:]
+                        if payload == "[DONE]":
+                            return
+                        collected.append(json.loads(payload))
+
+        sub_task = asyncio.create_task(_subscribe())
+        await asyncio.sleep(0.05)
+
+        # Fire-and-ack: 200 returns immediately; the hidden turn runs async.
+        resp = await client.post(
+            "/v1/sessions/conv_sdk_compact/events",
+            json={"type": "compact"},
+        )
+        assert resp.status_code == 200, (
+            f"claude-sdk compact must ack 200; got {resp.status_code}: {resp.text}"
+        )
+
+        # Wait for the hidden turn to drain the harness stream.
+        await asyncio.wait_for(stream_finished.wait(), timeout=2.0)
+        await asyncio.sleep(0.05)  # let the completed-indicator publish land
+
+        await client.delete("/v1/sessions/conv_sdk_compact")
+        await asyncio.wait_for(sub_task, timeout=5.0)
+
+    # The harness received exactly the hidden /compact message turn.
+    assert len(hc.posted_bodies) == 1, f"expected one harness POST, got {hc.posted_bodies}"
+    body = hc.posted_bodies[0]
+    assert body.get("type") == "message"
+    assert body.get("content") == [{"type": "input_text", "text": "/compact"}], (
+        f"must drive a /compact message turn; got {body}"
+    )
+    # MessageEvent requires a non-empty model (the agent name); without it the
+    # harness rejects the turn 422 and no compaction happens.
+    assert body.get("model"), f"hidden /compact turn must carry a model; got {body}"
+
+    # Indicators ARE published.
+    types_published = [e.get("type") for e in collected]
+    assert "response.compaction.in_progress" in types_published, types_published
+    assert "response.compaction.completed" in types_published, types_published
+
+    # The turn is HIDDEN: none of the harness turn's conversation frames
+    # (deltas, item.done, response.created/completed) reach the stream.
+    leaked = [
+        e
+        for e in collected
+        if e.get("type", "").startswith("response.")
+        and not e.get("type", "").startswith("response.compaction.")
+    ]
+    assert leaked == [], f"hidden /compact turn must not publish turn frames; leaked: {leaked}"
+    assert not any("should-not-leak" in json.dumps(e) for e in collected), (
+        "hidden turn's text delta leaked into the published stream"
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event_payload,inject_attr",
     # ``/fork`` creates a new conversation that reuses the

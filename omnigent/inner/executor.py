@@ -219,6 +219,29 @@ class TurnCancelled(ExecutorEvent):
 
 
 @dataclass
+class CompactionStatus(ExecutorEvent):
+    """The harness compacted (or is compacting) its own context in place.
+
+    Emitted by executors whose backend owns its context window and compacts it
+    natively (e.g. the Claude Agent SDK's ``/compact`` / auto-compaction).
+    Carried up so the runtime can surface the standard
+    ``response.compaction.*`` UI indicators — Omnigent does not summarize here;
+    it only observes and reports, mirroring the claude-native flow.
+
+    :param status: ``"in_progress"`` when compaction begins, ``"completed"``
+        when it finished, or ``"failed"`` on a compaction error.
+    :param trigger: ``"manual"`` (explicit ``/compact``) or ``"auto"``
+        (threshold-driven), when known; otherwise ``None``.
+    :param total_tokens: Post-compaction context size in tokens, when the
+        backend reports it; otherwise ``None``.
+    """
+
+    status: str = "in_progress"
+    trigger: str | None = None
+    total_tokens: int | None = None
+
+
+@dataclass
 class ExecutorError(ExecutorEvent):
     """Something went wrong.
 

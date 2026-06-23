@@ -1056,6 +1056,36 @@ def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -
     )
 
 
+def test_translate_event_compaction_status_emits_compaction_sse() -> None:
+    """``CompactionStatus`` maps to the standard ``response.compaction.*`` SSE.
+
+    The harness (claude-sdk) observes the SDK compacting its own context and
+    emits ``CompactionStatus``; the adapter translates it to the existing
+    compaction events so ``proxy_stream`` relays them to the UI with no special
+    handling. Covers in_progress / completed (with token count) / failed.
+    """
+    from omnigent.inner.executor import CompactionStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    adapter._translate_event(CompactionStatus(status="in_progress"), ctx)  # type: ignore[arg-type]
+    adapter._translate_event(  # type: ignore[arg-type]
+        CompactionStatus(status="completed", total_tokens=8421), ctx
+    )
+    adapter._translate_event(CompactionStatus(status="failed"), ctx)  # type: ignore[arg-type]
+
+    types = [e.type for e in ctx.emitted]
+    assert types == [
+        "response.compaction.in_progress",
+        "response.compaction.completed",
+        "response.compaction.failed",
+    ], f"unexpected compaction SSE sequence: {types!r}"
+    # The completed event carries the post-compaction token count for the ring.
+    assert ctx.emitted[1].total_tokens == 8421
+
+
 def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:
     """
     A ``ToolCallRequest`` with an MCP-prefixed name pushes the

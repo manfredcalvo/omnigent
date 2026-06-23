@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.claude_sdk_executor import _to_anthropic_content_blocks
 from omnigent.inner.executor import (
+    CompactionStatus,
     ExecutorError,
     TextChunk,
     ToolCallComplete,
@@ -1177,6 +1179,250 @@ class TestSystemMessages(unittest.TestCase):
             self.assertIn("401", events[0].message)
 
         _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Tests: in-place compaction observation (status/compact_result → CompactionStatus)
+# ---------------------------------------------------------------------------
+
+
+class TestCompaction(unittest.TestCase):
+    """The SDK compacts its own context; run_turn surfaces CompactionStatus.
+
+    The CLI signals compaction via ``SystemMessage(subtype="status")`` carrying
+    a ``compact_result`` / ``compact_error`` field (there is no PreCompact hook
+    on this path). A manual ``/compact`` turn self-terminates with a
+    ResultMessage on real context; on a near-empty context it is a no-op that
+    emits nothing, which a bounded timeout turns into a clean TurnComplete.
+    """
+
+    @staticmethod
+    def _fake_sdk(messages, *, blocking=False):
+        from claude_agent_sdk.types import ClaudeAgentOptions as SDKClaudeAgentOptions
+        from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+        from claude_agent_sdk.types import SystemMessage as SDKSystemMessage
+
+        class _ResultMessage:
+            def __init__(self, result="", usage=None):
+                self.result = result
+                self.usage = usage
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = SDKSystemMessage
+            ResultMessage = _ResultMessage
+            StreamEvent = SDKStreamEvent
+            ClaudeAgentOptions = SDKClaudeAgentOptions
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    if blocking:
+                        await asyncio.sleep(30)
+                        return
+                    for m in messages:
+                        yield m
+
+                async def disconnect(self):
+                    return None
+
+        return _FakeSDK, _ResultMessage, SDKSystemMessage
+
+    def _status(self, SDKSystemMessage, **data):
+        payload = {"type": "system", "subtype": "status"}
+        payload.update(data)
+        return SDKSystemMessage(subtype="status", data=payload)
+
+    def test_manual_compact_emits_in_progress_completed_and_terminates(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            fake, ResultMessage, SDKSystemMessage = self._fake_sdk([])
+            status = self._status(SDKSystemMessage, status="compacting", compact_result={"ok": 1})
+            fake.ClaudeSDKClient.receive_response = self._yielder(
+                [status, ResultMessage(result="")]
+            )
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "/compact"}], [], ""
+                    )
+                ]
+            compactions = [e for e in events if isinstance(e, CompactionStatus)]
+            statuses = [c.status for c in compactions]
+            self.assertEqual(statuses, ["in_progress", "completed"])
+            self.assertTrue(all(c.trigger == "manual" for c in compactions))
+            # The turn terminates (no hang) with a TurnComplete.
+            self.assertIsInstance(events[-1], TurnComplete)
+
+        _run(_t())
+
+    def test_compact_error_emits_failed(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            fake, ResultMessage, SDKSystemMessage = self._fake_sdk([])
+            status = self._status(
+                SDKSystemMessage,
+                status="error",
+                compact_result=None,
+                compact_error="boom",
+            )
+            fake.ClaudeSDKClient.receive_response = self._yielder(
+                [status, ResultMessage(result="")]
+            )
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "/compact"}], [], ""
+                    )
+                ]
+            statuses = [e.status for e in events if isinstance(e, CompactionStatus)]
+            self.assertEqual(statuses, ["in_progress", "failed"])
+
+        _run(_t())
+
+    def test_auto_compaction_mid_turn_marks_auto_and_continues(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            fake, ResultMessage, SDKSystemMessage = self._fake_sdk([])
+            status = self._status(SDKSystemMessage, status="compacting", compact_result={"ok": 1})
+            fake.ClaudeSDKClient.receive_response = self._yielder(
+                [status, ResultMessage(result="answer")]
+            )
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "do the thing"}], [], ""
+                    )
+                ]
+            compactions = [e for e in events if isinstance(e, CompactionStatus)]
+            self.assertEqual([c.status for c in compactions], ["in_progress", "completed"])
+            # Not a /compact turn → trigger is auto, and the turn still completes
+            # normally (carries the assistant response).
+            self.assertTrue(all(c.trigger == "auto" for c in compactions))
+            tc = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual(tc[-1].response, "answer")
+
+        _run(_t())
+
+    def test_noop_compact_terminates_within_bounded_timeout(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            fake, _ResultMessage, _ = self._fake_sdk([], blocking=True)
+            executor = ClaudeSDKExecutor()
+            with (
+                patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake),
+                patch(
+                    "omnigent.inner.claude_sdk_executor._COMPACT_TURN_TIMEOUT_SECONDS",
+                    0.3,
+                ),
+            ):
+                events = await asyncio.wait_for(
+                    self._collect(
+                        executor.run_turn([{"role": "user", "content": "/compact"}], [], "")
+                    ),
+                    timeout=10,
+                )
+            # No compaction happened (no-op): no CompactionStatus, but the turn
+            # ends promptly with a TurnComplete rather than hanging.
+            self.assertEqual([e for e in events if isinstance(e, CompactionStatus)], [])
+            self.assertTrue(any(isinstance(e, TurnComplete) for e in events))
+
+        _run(_t())
+
+    def test_compact_content_block_coerced_to_slash_string(self):
+        """A single ``/compact`` input_text block reaches query() as the STRING.
+
+        The runner's hidden /compact turn arrives as a content block; if it were
+        sent to the SDK as structured content the CLI would treat it as literal
+        text and never compact. Pin that it's coerced to the bare slash command.
+        """
+        from claude_agent_sdk.types import ClaudeAgentOptions as SDKClaudeAgentOptions
+        from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+        from claude_agent_sdk.types import SystemMessage as SDKSystemMessage
+
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        query_prompts: list[Any] = []
+
+        class _ResultMessage:
+            def __init__(self):
+                self.result = ""
+                self.usage = None
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = SDKSystemMessage
+            ResultMessage = _ResultMessage
+            StreamEvent = SDKStreamEvent
+            ClaudeAgentOptions = SDKClaudeAgentOptions
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    query_prompts.append(prompt)
+
+                async def receive_response(self):
+                    yield _FakeSDK.ResultMessage()
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                _ = [
+                    e
+                    async for e in executor.run_turn(
+                        [
+                            {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "/compact"}],
+                            }
+                        ],
+                        [],
+                        "",
+                    )
+                ]
+            self.assertEqual(query_prompts, ["/compact"])
+
+        _run(_t())
+
+    @staticmethod
+    def _yielder(messages):
+        async def receive_response(self):
+            for m in messages:
+                yield m
+
+        return receive_response
+
+    @staticmethod
+    async def _collect(agen):
+        return [e async for e in agen]
 
 
 # ---------------------------------------------------------------------------
