@@ -7758,8 +7758,15 @@ def create_runner_app(
             # turn never lands in the transcript/UI, only the spinner shows.
             import json as _json
 
-            _saw_in_progress = False
-            _saw_done = False
+            # Acknowledge immediately so the UI is never silent: show the
+            # spinner up front, then resolve it below (a terminal event always
+            # follows — relayed from the harness, or the backstop in ``finally``).
+            _publish_event(
+                conv_id,
+                {"type": "response.compaction.in_progress", "session_id": conv_id},
+            )
+            _terminal_published = False  # a completed/failed reached the stream
+            _failed = False  # busy / error → resolve as failed, not completed
             try:
                 client = await process_manager.get_client(conv_id, "claude-sdk")
                 # MessageEvent requires a non-empty ``model`` (the agent name,
@@ -7780,7 +7787,22 @@ def create_runner_app(
                     json=compact_msg,
                     timeout=None,
                 ) as resp:
+                    if resp.status_code == 204:
+                        # 204 = the harness injected the message instead of
+                        # starting a turn, i.e. a turn is already in flight. We
+                        # can't compact mid-turn; resolve as failed (don't claim
+                        # success) so the spinner clears with no compacted marker.
+                        # NOTE: the runner's _active_turns can desync from the
+                        # harness's in-flight state, so this is the reliable
+                        # "busy" signal.
+                        _failed = True
+                        _logger.info(
+                            "claude-sdk /compact deferred for %s: a turn is in flight (204)",
+                            conv_id,
+                        )
+                        return
                     if resp.status_code != 200:
+                        _failed = True
                         _logger.warning(
                             "claude-sdk /compact turn rejected for %s: status=%s",
                             conv_id,
@@ -7788,8 +7810,10 @@ def create_runner_app(
                         )
                         return
                     # Drain the turn's stream (drives the SDK compaction in the
-                    # harness's owning task). Relay only compaction indicators;
-                    # frame on the SSE record boundary like proxy_stream.
+                    # harness's owning task). Relay only the TERMINAL compaction
+                    # indicators (completed/failed) — the up-front in_progress
+                    # already covers the spinner. Frame on the SSE record
+                    # boundary like proxy_stream.
                     _buf = ""
                     async for chunk in resp.aiter_text():
                         _buf += chunk
@@ -7805,31 +7829,38 @@ def create_runner_app(
                                 except (ValueError, TypeError):
                                     continue
                                 _etype = str(evt.get("type", "")) if isinstance(evt, dict) else ""
-                                if _etype.startswith("response.compaction."):
+                                if _etype in (
+                                    "response.compaction.completed",
+                                    "response.compaction.failed",
+                                ):
                                     _publish_event(conv_id, evt)
-                                    if _etype == "response.compaction.in_progress":
-                                        _saw_in_progress = True
-                                    elif _etype in (
-                                        "response.compaction.completed",
-                                        "response.compaction.failed",
-                                    ):
-                                        _saw_done = True
+                                    _terminal_published = True
                 _logger.info(
-                    "claude-sdk /compact for %s: in_progress=%s done=%s",
+                    "claude-sdk /compact for %s: terminal_relayed=%s",
                     conv_id,
-                    _saw_in_progress,
-                    _saw_done,
+                    _terminal_published,
                 )
             except Exception:
+                _failed = True
                 _logger.exception("claude-sdk /compact failed for %s", conv_id)
             finally:
-                # Backstop: if the spinner was shown but the turn ended without a
-                # terminal compaction event (mid-compact error / drain failure),
-                # clear it so the UI never sticks on "Compacting…".
-                if _saw_in_progress and not _saw_done:
+                # Always resolve the up-front spinner so the UI is never left
+                # hanging on "Compacting…". If the harness already relayed a
+                # terminal event, nothing to do. Otherwise emit one: ``failed``
+                # for busy/error, else ``completed`` (a real compaction that the
+                # harness didn't surface a terminal for, or a no-op that had
+                # nothing to compact).
+                if not _terminal_published:
                     _publish_event(
                         conv_id,
-                        {"type": "response.compaction.completed", "session_id": conv_id},
+                        {
+                            "type": (
+                                "response.compaction.failed"
+                                if _failed
+                                else "response.compaction.completed"
+                            ),
+                            "session_id": conv_id,
+                        },
                     )
 
         task = asyncio.create_task(_run_compact())

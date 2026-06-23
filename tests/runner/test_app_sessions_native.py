@@ -109,6 +109,7 @@ class _ScriptedHarnessClient:
         sse_frames: list[str],
         *,
         stream_finished: asyncio.Event | None = None,
+        stream_status_code: int = 200,
     ) -> None:
         """
         Initialize with the SSE frames to relay.
@@ -116,11 +117,15 @@ class _ScriptedHarnessClient:
         :param sse_frames: SSE frames returned by the harness stream.
         :param stream_finished: Optional event set after ``aiter_text``
             exhausts the scripted frames.
+        :param stream_status_code: HTTP status the streamed POST reports
+            (e.g. ``204`` to simulate the harness injecting instead of
+            starting a turn).
         :returns: None.
         """
         self.posted_bodies: list[dict[str, Any]] = []
         self._sse_frames = sse_frames
         self._stream_finished = stream_finished
+        self._stream_status_code = stream_status_code
         self.patched_events: list[dict[str, Any]] = []
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
@@ -129,12 +134,15 @@ class _ScriptedHarnessClient:
         self.posted_bodies.append(json)
         scripted = self._sse_frames
         stream_finished = self._stream_finished
+        status_code_ = self._stream_status_code
 
         class _StreamCtx:
-            status_code = 200
+            status_code = status_code_
 
             async def __aenter__(self) -> _ScriptedHarnessClient._StreamHandle:
-                return _ScriptedHarnessClient._StreamHandle(scripted, stream_finished)
+                return _ScriptedHarnessClient._StreamHandle(
+                    scripted, stream_finished, status_code_
+                )
 
             async def __aexit__(self, *_: Any) -> None:
                 return None
@@ -142,12 +150,11 @@ class _ScriptedHarnessClient:
         return _StreamCtx()
 
     class _StreamHandle:
-        status_code = 200
-
         def __init__(
             self,
             frames: list[str],
             stream_finished: asyncio.Event | None,
+            status_code: int = 200,
         ) -> None:
             """
             Initialize a scripted stream handle.
@@ -155,10 +162,12 @@ class _ScriptedHarnessClient:
             :param frames: SSE frame strings to yield.
             :param stream_finished: Optional event set after all frames are
                 yielded.
+            :param status_code: HTTP status the streamed POST reports.
             :returns: None.
             """
             self._frames = frames
             self._stream_finished = stream_finished
+            self.status_code = status_code
 
         async def aiter_text(self) -> AsyncIterator[str]:
             """
@@ -10144,6 +10153,82 @@ async def test_events_compact_on_claude_sdk_runs_hidden_turn() -> None:
     assert not any("should-not-leak" in json.dumps(e) for e in collected), (
         "hidden turn's text delta leaked into the published stream"
     )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_claude_sdk_busy_turn_resolves_gracefully() -> None:
+    """A claude-sdk ``/compact`` while a turn is in flight never goes silent.
+
+    When a turn is active the harness returns 204 (it injects the message
+    instead of starting a turn). The runner must still acknowledge the
+    /compact with an ``in_progress`` indicator and then resolve it as
+    ``failed`` (not ``completed`` — nothing was compacted) so the UI spinner
+    always clears. Regression for a live-session desync where the runner
+    thought the session was idle and silently swallowed the /compact.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    # 204 = harness injected (a turn is in flight); no frames are streamed.
+    hc = _ScriptedHarnessClient([], stream_status_code=204)
+    pm = _FakeProcessManager(hc)
+    spec = AgentSpec(
+        spec_version=1,
+        name="sdk-compact-busy",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_sdk_busy", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        collected: list[dict[str, Any]] = []
+
+        async def _subscribe() -> None:
+            async with client.stream("GET", "/v1/sessions/conv_sdk_busy/stream") as stream:
+                async for line in stream.aiter_lines():
+                    if line.startswith("data: "):
+                        payload = line[6:]
+                        if payload == "[DONE]":
+                            return
+                        collected.append(json.loads(payload))
+
+        sub_task = asyncio.create_task(_subscribe())
+        await asyncio.sleep(0.05)
+
+        resp = await client.post(
+            "/v1/sessions/conv_sdk_busy/events",
+            json={"type": "compact"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Wait for the failed (terminal) indicator to land.
+        for _ in range(40):
+            if any(e.get("type") == "response.compaction.failed" for e in collected):
+                break
+            await asyncio.sleep(0.05)
+
+        await client.delete("/v1/sessions/conv_sdk_busy")
+        await asyncio.wait_for(sub_task, timeout=5.0)
+
+    types_published = [e.get("type") for e in collected]
+    # Never silent: acknowledged up front, then resolved.
+    assert "response.compaction.in_progress" in types_published, types_published
+    assert "response.compaction.failed" in types_published, types_published
+    # Must NOT claim success — nothing was compacted (a turn was in flight).
+    assert "response.compaction.completed" not in types_published, types_published
 
 
 @pytest.mark.asyncio
